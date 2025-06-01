@@ -10,11 +10,10 @@
  * - Does NOT provide pricing information (we handle this separately)
  */
 
-const axios = require('axios');
+const aviationStack = require('./aviationStack');
 // We don't use mockFlights as per the rule to only use AviationStack API
 
 // AviationStack API configuration
-const AVIATION_STACK_API_URL = 'http://api.aviationstack.com/v1';
 const API_KEY = process.env.AVIATION_STACK_API_KEY;
 
 /**
@@ -38,28 +37,11 @@ const searchAirports = async (keyword) => {
   try {
     validateApiKey();
     
-    console.log(`[AVIATION SERVICE] Querying AviationStack API for airports with keyword: "${keyword}"`);
-    const response = await axios.get(`${AVIATION_STACK_API_URL}/airports`, {
-      params: {
-        access_key: API_KEY,
-        search: keyword
-      }
-    });
+    // Use the aviationStack implementation
+    console.log(`[AVIATION SERVICE] Delegating airport search to aviationStack service`);
+    const airports = await aviationStack.searchAirports(keyword);
     
-    if (!response.data || !response.data.data) {
-      console.error('[AVIATION SERVICE] Invalid response from AviationStack API');
-      throw new Error('Invalid response from AviationStack API');
-    }
-    
-    // Transform the API response to match our format
-    const airports = response.data.data.map(airport => ({
-      iataCode: airport.iata_code,
-      name: airport.airport_name,
-      city: airport.city,
-      country: airport.country_name
-    })).filter(airport => airport.iataCode); // Only include airports with IATA codes
-    
-    console.log(`[AVIATION SERVICE] Found ${airports.length} airports from AviationStack API`);
+    console.log(`[AVIATION SERVICE] Found ${airports.length} airports from aviationStack service`);
     return airports;
   } catch (error) {
     console.error('[AVIATION SERVICE] Error searching airports:', error.message);
@@ -88,40 +70,25 @@ const searchFlights = async (params) => {
   try {
     validateApiKey();
     
-    // Format date for AviationStack API (YYYY-MM-DD)
-    const formattedDate = departureDate;
+    // Use the aviationStack implementation for both current and future flights
+    console.log(`[AVIATION SERVICE] Delegating flight search to aviationStack service`);
     
-    console.log(`[AVIATION SERVICE] Querying AviationStack API for flights from ${originLocationCode} to ${destinationLocationCode} on ${formattedDate}`);
+    // Get the raw flight data and metadata from aviationStack
+    const result = await aviationStack.searchFlights(params);
     
-    const response = await axios.get(`${AVIATION_STACK_API_URL}/flights`, {
-      params: {
-        access_key: API_KEY,
-        dep_iata: originLocationCode,
-        arr_iata: destinationLocationCode,
-        flight_date: formattedDate
-      }
-    });
-    
-    if (!response.data || !response.data.data) {
-      console.error('[AVIATION SERVICE] Invalid response from AviationStack API');
-      throw new Error('Invalid response from AviationStack API');
+    if (!result || !result.flights) {
+      console.error('[AVIATION SERVICE] Invalid response from aviationStack service');
+      throw new Error('Invalid response from aviationStack service');
     }
     
-    // Transform the API response to match our format
-    const flights = response.data.data.map(flight => {
-      // Calculate duration in hours and minutes
-      const departureTime = new Date(`${flight.flight_date}T${flight.departure.scheduled.slice(11, 16)}:00`);
-      const arrivalTime = new Date(`${flight.flight_date}T${flight.arrival.scheduled.slice(11, 16)}:00`);
-      const durationMs = arrivalTime - departureTime;
-      const durationHours = Math.floor(durationMs / (1000 * 60 * 60));
-      const durationMinutes = Math.floor((durationMs % (1000 * 60 * 60)) / (1000 * 60));
-      
+    // Add pricing data to each flight since aviationStack doesn't provide pricing
+    const flightsWithPricing = result.flights.map(flight => {
       // PRICING IMPLEMENTATION NOTE:
       // AviationStack API does NOT provide pricing information for flights
       // The code below is a TEMPORARY SOLUTION to generate realistic prices
       // TODO: Replace with actual pricing API integration (e.g., Amadeus, Sabre, or other pricing provider)
       // This is the ONLY part where we don't use real AviationStack data
-      const isInternational = flight.flight.iata.startsWith('I');
+      const isInternational = flight.flightNumber.startsWith('I');
       const basePrice = isInternational ? 
         Math.floor(500 + Math.random() * 1500) : // $500-$2000 for international
         Math.floor(150 + Math.random() * 450);   // $150-$600 for domestic
@@ -132,44 +99,41 @@ const searchFlights = async (params) => {
       if (travelClass === 'BUSINESS') finalPrice *= 2.5;
       if (travelClass === 'FIRST') finalPrice *= 4;
       
+      // Return the flight with price and class data added
       return {
-        id: flight.flight.iata,
-        airline: flight.airline.name,
-        origin: {
-          iataCode: flight.departure.iata,
-          name: flight.departure.airport,
-          city: flight.departure.city || '',
-          country: flight.departure.country || ''
-        },
-        destination: {
-          iataCode: flight.arrival.iata,
-          name: flight.arrival.airport,
-          city: flight.arrival.city || '',
-          country: flight.arrival.country || ''
-        },
-        departureDate: flight.flight_date,
-        departureTime: flight.departure.scheduled.slice(11, 16),
-        arrivalDate: flight.flight_date, // May need adjustment for overnight flights
-        arrivalTime: flight.arrival.scheduled.slice(11, 16),
-        duration: `${durationHours}h ${durationMinutes}m`,
+        ...flight,
         price: finalPrice,
         class: travelClass,
         seats: Math.floor(50 + Math.random() * 150), // Random seat availability
-        flightNumber: flight.flight.iata,
-        isMockData: false // This is real data
       };
     });
     
-    console.log(`[AVIATION SERVICE] Found ${flights.length} flights from AviationStack API`);
+    console.log(`[AVIATION SERVICE] Found ${flightsWithPricing.length} flights from aviationStack service`);
     
-    // Return flights even if empty - don't fallback to mock data
-    return flights;
+    // Return a structured response with flights and metadata
+    return {
+      flights: flightsWithPricing,
+      metadata: {
+        count: flightsWithPricing.length,
+        requestInfo: {
+          origin: originLocationCode,
+          destination: destinationLocationCode,
+          date: departureDate,
+          class: travelClass
+        },
+        dateValidation: result.dateValidation,
+        apiResponseSummary: result.apiResponse ? {
+          total: result.apiResponse.total || 0,
+          limit: result.apiResponse.limit || 100,
+          offset: result.apiResponse.offset || 0
+        } : null,
+        emptyResultContext: result.emptyResultContext
+      }
+    };
   } catch (error) {
     console.error('[AVIATION SERVICE] Error searching flights:', error.message);
     
     // Error out explicitly instead of falling back to mock data
-    // Note: We attempt to retrieve future flight schedules from AviationStack
-    // and let the API determine what data is available
     throw new Error(`AviationStack API error: ${error.message}`);
   }
 };
@@ -179,9 +143,13 @@ const searchFlights = async (params) => {
  * @returns {Object} Service status information
  */
 const getServiceStatus = () => {
+  // Delegate to aviationStack's more detailed service status
+  const aviationStackStatus = aviationStack.getServiceStatus();
+  
   return {
-    provider: 'AviationStack API',
-    apiKeyConfigured: !!API_KEY,
+    ...aviationStackStatus,
+    serviceImplementation: 'aviationService using aviationStack',
+    pricingAvailable: true, // We add synthetic pricing data
     timestamp: new Date().toISOString()
   };
 };

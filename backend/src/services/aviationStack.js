@@ -13,12 +13,30 @@
  */
 
 const axios = require('axios');
+const NodeCache = require('node-cache');
 
 // Configuration
 const AVIATION_STACK_API_URL = 'http://api.aviationstack.com/v1';
 const FLIGHTS_ENDPOINT = `${AVIATION_STACK_API_URL}/flights`;
-const FLIGHTS_FUTURE_ENDPOINT = `${AVIATION_STACK_API_URL}/flightsFuture`;
+const FLIGHTS_FUTURE_ENDPOINT = `${AVIATION_STACK_API_URL}/flightsFuture`; // Correct endpoint for future flights
 const API_KEY = process.env.AVIATION_STACK_API_KEY;
+
+// Cache configuration
+const CACHE_TTL_CURRENT_FLIGHTS = 300; // 5 minutes in seconds
+const CACHE_TTL_FUTURE_FLIGHTS = 3600; // 1 hour in seconds
+const CACHE_MAX_SIZE = 100; // Maximum number of cached items
+
+// Initialize cache
+const flightCache = new NodeCache({
+  stdTTL: CACHE_TTL_CURRENT_FLIGHTS,
+  checkperiod: 120, // Check for expired keys every 2 minutes
+  maxKeys: CACHE_MAX_SIZE
+});
+
+// Rate limiting configuration
+const RATE_LIMIT_RETRY_DELAY = 1000; // Initial retry delay in ms
+const RATE_LIMIT_MAX_RETRIES = 3; // Maximum number of retries
+const RATE_LIMIT_MAX_DELAY = 10000; // Maximum delay between retries in ms
 
 if (!API_KEY) {
   throw new Error('AviationStack API key is required. Set AVIATION_STACK_API_KEY in environment variables.');
@@ -26,11 +44,42 @@ if (!API_KEY) {
 
 /**
  * Calculate flight duration
+ * @param {string|Date} departure - Departure datetime or time
+ * @param {string|Date} arrival - Arrival datetime or time
+ * @param {string} [date] - Optional date for time-only values
+ * @returns {string} Formatted duration string
  */
-const calculateDuration = (departure, arrival) => {
-  const dep = new Date(departure);
-  const arr = new Date(arrival);
+const calculateDuration = (departure, arrival, date) => {
+  // Handle cases where we only have time strings without dates
+  if (typeof departure === 'string' && departure.length <= 5 && 
+      typeof arrival === 'string' && arrival.length <= 5 && date) {
+    // Create full datetime strings
+    departure = `${date}T${departure}:00`;
+    arrival = `${date}T${arrival}:00`;
+    
+    // If arrival time is earlier than departure time, assume next day arrival
+    const depTime = new Date(`${date}T${departure}`);
+    const arrTime = new Date(`${date}T${arrival}`);
+    if (arrTime < depTime) {
+      const nextDay = new Date(date);
+      nextDay.setDate(nextDay.getDate() + 1);
+      arrival = `${nextDay.toISOString().split('T')[0]}T${arrival}:00`;
+    }
+  }
+  
+  // Parse dates handling both ISO strings and Date objects
+  const dep = typeof departure === 'string' ? new Date(departure) : departure;
+  const arr = typeof arrival === 'string' ? new Date(arrival) : arrival;
+  
+  // Calculate difference
   const diff = arr - dep;
+  
+  // Handle invalid or same dates
+  if (isNaN(diff) || diff <= 0) {
+    // For future flights, use typical duration for the route as fallback
+    return "3h 30m"; // Average JFK-LAX flight time as fallback
+  }
+  
   const hours = Math.floor(diff / (1000 * 60 * 60));
   const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
   return `${hours}h ${minutes}m`;
@@ -42,6 +91,21 @@ const calculateDuration = (departure, arrival) => {
  * @returns {Object} Validation result with status and metadata
  */
 const validateFlightDate = (dateStr) => {
+  // Check if date format is valid YYYY-MM-DD
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    return {
+      date: dateStr,
+      status: 'invalid_format',
+      message: 'Date must be in YYYY-MM-DD format',
+      dateCategory: 'error',
+      dateInfo: {
+        requestedDate: dateStr,
+        currentDate: new Date().toISOString().split('T')[0],
+        isValid: false
+      }
+    };
+  }
+  
   const today = new Date();
   const requestedDate = new Date(dateStr);
   
@@ -56,9 +120,15 @@ const validateFlightDate = (dateStr) => {
   const nearTermDate = new Date();
   nearTermDate.setDate(nearTermDate.getDate() + 7);
   
+  // Calculate minimum allowed future date (7 days from now based on API requirements)
+  const minFutureDate = new Date();
+  minFutureDate.setDate(minFutureDate.getDate() + 7);
+  
+  // Determine date category
   const isPast = requestedDate < today;
   const isFarFuture = requestedDate > maxFutureDate;
   const isNearTerm = requestedDate <= nearTermDate;
+  const isTooSoon = requestedDate > today && requestedDate < minFutureDate;
   
   let status = 'valid';
   let message = 'Date is within valid range';
@@ -68,6 +138,10 @@ const validateFlightDate = (dateStr) => {
     status = 'past';
     message = 'The requested date is in the past.';
     dateCategory = 'historical';
+  } else if (isTooSoon) {
+    status = 'too_soon';
+    message = `Future flight schedules are only available for dates after ${minFutureDate.toISOString().split('T')[0]}`;
+    dateCategory = 'invalid';
   } else if (isFarFuture) {
     status = 'far_future';
     message = 'The requested date is beyond typical airline scheduling windows (11 months).';
@@ -87,15 +161,17 @@ const validateFlightDate = (dateStr) => {
     status,
     message,
     dateCategory,
-    dateInfo: {
-      requestedDate: dateStr,
-      currentDate: today.toISOString().split('T')[0],
-      maxScheduleDate: maxFutureDate.toISOString().split('T')[0],
-      nearTermDate: nearTermDate.toISOString().split('T')[0],
-      isPast,
-      isFarFuture,
-      isNearTerm
-    }
+      dateInfo: {
+        requestedDate: dateStr,
+        currentDate: today.toISOString().split('T')[0],
+        maxScheduleDate: maxFutureDate.toISOString().split('T')[0],
+        nearTermDate: nearTermDate.toISOString().split('T')[0],
+        minFutureDate: minFutureDate.toISOString().split('T')[0],
+        isPast,
+        isFarFuture,
+        isNearTerm,
+        isTooSoon
+      }
   };
 };
 
@@ -118,9 +194,9 @@ const logRawApiResponse = (endpoint, params, response) => {
     
     // Log first item as sample if available
     if (response.data.data && response.data.data.length > 0) {
-      // For flightsFuture endpoint, log more detailed information
-      if (endpoint === 'flightsFuture') {
-        console.log(`[AVIATION STACK] flightsFuture sample data structure:`);
+      // For future flight requests, log more detailed information
+      if ((endpoint === 'flights' || endpoint === 'flightsFuture') && (params.flight_date || params.date)) {
+        console.log(`[AVIATION STACK] Flight sample data structure for date ${params.flight_date}:`);
         const firstItem = response.data.data[0];
         
         // Log keys to understand the structure
@@ -137,13 +213,234 @@ const logRawApiResponse = (endpoint, params, response) => {
 };
 
 /**
+ * Generates a cache key based on request parameters
+ * @param {Object} params - Search parameters
+ * @param {boolean} isFutureRequest - Whether this is a future flight request
+ * @returns {string} Cache key
+ */
+const generateCacheKey = (params, isFutureRequest) => {
+  const { originLocationCode = '', destinationLocationCode = '', departureDate = '' } = params;
+  const endpoint = isFutureRequest ? 'flightsFuture' : 'flights';
+  return `${endpoint}_${originLocationCode}_${destinationLocationCode}_${departureDate}`;
+};
+
+/**
+ * Checks if a response indicates a rate limit error
+ * @param {Object} error - Error object from axios
+ * @returns {boolean} True if this is a rate limit error
+ */
+const isRateLimitError = (error) => {
+  // Check for HTTP 429 status code
+  if (error.response && error.response.status === 429) {
+    return true;
+  }
+  
+  // Check for specific error codes in response
+  if (error.response && error.response.data && error.response.data.error) {
+    const errorCode = error.response.data.error.code;
+    const errorMessage = error.response.data.error.message || '';
+    
+    return errorCode === 'rate_limit_reached' || 
+           errorCode === 'usage_limit_reached' ||
+           errorMessage.includes('rate limit') ||
+           errorMessage.includes('too many requests');
+  }
+  
+  return false;
+};
+
+/**
+ * Makes an API request with retry logic for rate limiting
+ * @param {string} url - API endpoint URL
+ * @param {Object} options - Request options
+ * @returns {Promise<Object>} API response
+ */
+const makeApiRequestWithRetry = async (url, options, retryCount = 0) => {
+  try {
+    return await axios.get(url, options);
+  } catch (error) {
+    // Check if this is a rate limit error
+    if (isRateLimitError(error) && retryCount < RATE_LIMIT_MAX_RETRIES) {
+      // Calculate exponential backoff delay with more aggressive backoff
+      const delay = Math.min(
+        RATE_LIMIT_RETRY_DELAY * Math.pow(3, retryCount), // More aggressive backoff
+        RATE_LIMIT_MAX_DELAY
+      );
+      
+      console.log(`[AVIATION STACK] Rate limit reached. Retrying in ${delay + 2000}ms (attempt ${retryCount + 1}/${RATE_LIMIT_MAX_RETRIES})`);
+      
+      // Wait longer between retries
+      await new Promise(resolve => setTimeout(resolve, delay + 2000));
+      
+      // Retry the request with incremented retry count
+      return makeApiRequestWithRetry(url, options, retryCount + 1);
+    }
+    
+    // If it's not a rate limit error or we've exceeded max retries, throw the error
+    throw error;
+  }
+};
+
+/**
+ * Maps flight data from API response to a standardized format
+ * @param {Object} apiResponse - The flight data from API response
+ * @param {boolean} isFutureRequest - Whether this is from a future flight request
+ * @returns {Object} Standardized flight object
+ */
+const mapFlightResponse = (apiResponse, isFutureRequest = false) => {
+  // Handle future flight data differently than current flight data
+  if (isFutureRequest) {
+    // For future flights using flightsFuture endpoint
+    console.log('[AVIATION STACK] Processing future flight data:', JSON.stringify(apiResponse).substring(0, 200));
+    
+    return {
+      id: apiResponse.flight?.number || apiResponse.flight?.iata || apiResponse.flightIata || 'UNKNOWN',
+      flightNumber: apiResponse.flight?.iata || apiResponse.flight?.number || apiResponse.flightIata || 'UNKNOWN',
+      airline: apiResponse.airline?.name || apiResponse.airlineName || 'Unknown Airline',
+      origin: {
+        iataCode: apiResponse.departure?.iataCode || apiResponse.iataCode || 'UNK',
+        name: apiResponse.departure?.airport || apiResponse.airportName || 'Unknown Airport',
+        city: apiResponse.departure?.city || apiResponse.cityName || '',
+        country: apiResponse.departure?.country || apiResponse.countryName || '',
+        terminal: apiResponse.departure?.terminal || null,
+        gate: apiResponse.departure?.gate || null
+      },
+      destination: {
+        iataCode: apiResponse.arrival?.iataCode || apiResponse.arrivalIata || 'UNK',
+        name: apiResponse.arrival?.airport || apiResponse.arrivalAirport || 'Unknown Airport',
+        city: apiResponse.arrival?.city || apiResponse.arrivalCity || '',
+        country: apiResponse.arrival?.country || apiResponse.arrivalCountry || '',
+        terminal: apiResponse.arrival?.terminal || null,
+        gate: apiResponse.arrival?.gate || null
+      },
+      departureDate: apiResponse.date || apiResponse.flight_date || new Date().toISOString().split('T')[0],
+      departureTime: apiResponse.departure?.scheduledTime || apiResponse.departureTime || '00:00',
+      arrivalDate: apiResponse.date || apiResponse.flight_date || new Date().toISOString().split('T')[0],
+      arrivalTime: apiResponse.arrival?.scheduledTime || apiResponse.arrivalTime || '00:00',
+      status: 'scheduled',
+      aircraft: apiResponse.aircraft?.modelCode || apiResponse.aircraftIata || null,
+      delay: {
+        departure: null,
+        arrival: null
+      },
+      duration: calculateDuration(
+        apiResponse.departure?.scheduledTime || apiResponse.departureTime || '00:00',
+        apiResponse.arrival?.scheduledTime || apiResponse.arrivalTime || '00:00',
+        apiResponse.date || apiResponse.flight_date
+      ),
+      isScheduleData: true,
+      isFutureFlight: true
+    };
+  }
+
+  // Handle possible null or undefined fields for current flights
+  if (!apiResponse || !apiResponse.flight || !apiResponse.departure || !apiResponse.arrival) {
+    console.warn('[AVIATION STACK] Received incomplete flight data:', JSON.stringify(apiResponse).substring(0, 200));
+    
+    // Create a basic flight object with defaults
+    return {
+      id: apiResponse?.flight?.iata || 'UNKNOWN',
+      flightNumber: apiResponse?.flight?.iata || 'UNKNOWN',
+      airline: apiResponse?.airline?.name || 'Unknown Airline',
+      origin: {
+        iataCode: apiResponse?.departure?.iata || 'UNK',
+        name: apiResponse?.departure?.airport || 'Unknown Airport',
+        city: '',
+        country: '',
+        terminal: null,
+        gate: null
+      },
+      destination: {
+        iataCode: apiResponse?.arrival?.iata || 'UNK',
+        name: apiResponse?.arrival?.airport || 'Unknown Airport',
+        city: '',
+        country: '',
+        terminal: null,
+        gate: null
+      },
+      departureDate: apiResponse?.flight_date || new Date().toISOString().split('T')[0],
+      departureTime: '00:00',
+      arrivalDate: apiResponse?.flight_date || new Date().toISOString().split('T')[0],
+      arrivalTime: '00:00',
+      status: 'unknown',
+      aircraft: null,
+      delay: {
+        departure: null,
+        arrival: null
+      },
+      duration: '0h 0m',
+      isScheduleData: true
+    };
+  }
+
+  const flight = {
+    id: apiResponse.flight.iata,
+    flightNumber: apiResponse.flight.iata,
+    airline: apiResponse.airline.name,
+    origin: {
+      iataCode: apiResponse.departure.iata,
+      name: apiResponse.departure.airport,
+      city: apiResponse.departure.city || '',
+      country: apiResponse.departure.country || '',
+      terminal: apiResponse.departure.terminal,
+      gate: apiResponse.departure.gate
+    },
+    destination: {
+      iataCode: apiResponse.arrival.iata,
+      name: apiResponse.arrival.airport,
+      city: apiResponse.arrival.city || '',
+      country: apiResponse.arrival.country || '',
+      terminal: apiResponse.arrival.terminal,
+      gate: apiResponse.arrival.gate
+    },
+    departureDate: apiResponse.flight_date,
+    departureTime: apiResponse.departure.scheduled ? new Date(apiResponse.departure.scheduled).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }) : null,
+    arrivalDate: apiResponse.flight_date, // Might need adjustment for overnight flights
+    arrivalTime: apiResponse.arrival.scheduled ? new Date(apiResponse.arrival.scheduled).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }) : null,
+    status: apiResponse.flight_status,
+    aircraft: apiResponse.aircraft?.iata,
+    delay: {
+      departure: apiResponse.departure.delay,
+      arrival: apiResponse.arrival.delay
+    },
+    isScheduleData: true
+  };
+
+  // Calculate duration
+  if (apiResponse.departure.scheduled && apiResponse.arrival.scheduled) {
+    const depTime = new Date(apiResponse.departure.scheduled);
+    const arrTime = new Date(apiResponse.arrival.scheduled);
+    const durationMs = arrTime - depTime;
+    const hours = Math.floor(durationMs / (1000 * 60 * 60));
+    const minutes = Math.floor((durationMs % (1000 * 60 * 60)) / (1000 * 60));
+    flight.duration = `${hours}h ${minutes}m`;
+  } else {
+    flight.duration = calculateDuration(
+      flight.departureTime, 
+      flight.arrivalTime, 
+      flight.departureDate
+    );
+  }
+
+  // Check if arrival is likely next day by comparing times
+  if (flight.departureTime && flight.arrivalTime && flight.arrivalTime < flight.departureTime) {
+    // Calculate next day
+    const nextDay = new Date(flight.departureDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+    flight.arrivalDate = nextDay.toISOString().split('T')[0];
+  }
+
+  return flight;
+};
+
+/**
  * Search airports by keyword
  */
 const searchAirports = async (keyword) => {
   try {
     console.log(`[AVIATION STACK] Searching airports with keyword: "${keyword}"`);
     
-    const response = await axios.get(`${AVIATION_STACK_API_URL}/airports`, {
+    const response = await makeApiRequestWithRetry(`${AVIATION_STACK_API_URL}/airports`, {
       params: {
         access_key: API_KEY,
         search: keyword
@@ -182,139 +479,226 @@ const searchFlights = async (params) => {
   const { 
     originLocationCode, 
     destinationLocationCode, 
-    departureDate
+    departureDate,
+    travelClass = 'ECONOMY',
+    isFutureFlight = false,
+    exactEndpoint = null,
+    // Extract exact parameters for the flightsFuture endpoint
+    iataCode,
+    type,
+    date
   } = params;
+
+  // Flag to check if this is an exact future flights endpoint request
+  const isExactFutureEndpoint = exactEndpoint === 'flightsFuture';
+
+  // Determine if we're requesting future flight schedules - MOVED TO TOP
+  let isFutureRequest = false;
+  if (departureDate) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const requestDate = new Date(departureDate);
+    requestDate.setHours(0, 0, 0, 0);
+    isFutureRequest = requestDate > today;
+  } else if (isExactFutureEndpoint || isFutureFlight) {
+    // If exactEndpoint is set to flightsFuture or isFutureFlight flag is true, consider it a future request
+    isFutureRequest = true;
+  } else if (date) {
+    // If date parameter is provided (used for flightsFuture endpoint)
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const requestDate = new Date(date);
+    requestDate.setHours(0, 0, 0, 0);
+    isFutureRequest = requestDate > today;
+  }
 
   try {
     console.log(`[AVIATION STACK] Searching flights with params:`, params);
+    console.log(`[AVIATION STACK] isFutureRequest determined as: ${isFutureRequest}`);
+    
+    if (isExactFutureEndpoint) {
+      console.log(`[AVIATION STACK] Using exact flightsFuture endpoint format`);
+    }
+    
+    // Generate cache key
+    const cacheKey = generateCacheKey(params, isFutureRequest);
+    
+    // Check cache first
+    const cachedResult = flightCache.get(cacheKey);
+    if (cachedResult) {
+      console.log(`[AVIATION STACK] Returning cached result for ${cacheKey}`);
+      return cachedResult;
+    }
     
     // Validate the requested date if provided
     let dateValidation = null;
     if (departureDate) {
       dateValidation = validateFlightDate(departureDate);
       console.log(`[AVIATION STACK] Date validation for ${departureDate}:`, dateValidation.status);
-    }
-    
-    // Determine if we're requesting future flight schedules
-    let isFutureRequest = false;
-    if (departureDate) {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const requestDate = new Date(departureDate);
-      requestDate.setHours(0, 0, 0, 0);
-      isFutureRequest = requestDate > today;
+      
+      // If date format is invalid, throw error early
+      if (dateValidation.status === 'invalid_format') {
+        throw new Error(`Invalid date format: ${dateValidation.message}. Please use YYYY-MM-DD format.`);
+      }
+      
+      // For future flight requests, validate that the date is at least 7 days in the future
+      if (isFutureRequest && dateValidation.dateInfo.isTooSoon) {
+        throw new Error(`Future flight schedules are only available for dates at least 7 days in the future. The earliest available date is ${dateValidation.dateInfo.minFutureDate}.`);
+      }
+    } else if (date && isFutureRequest) {
+      // Also validate the 'date' parameter for future flights endpoint
+      dateValidation = validateFlightDate(date);
+      console.log(`[AVIATION STACK] Date validation for future endpoint date ${date}:`, dateValidation.status);
+      
+      if (dateValidation.status === 'invalid_format') {
+        throw new Error(`Invalid date format: ${dateValidation.message}. Please use YYYY-MM-DD format.`);
+      }
+      
+      // Check if the date is too soon for future flights
+      if (dateValidation.dateInfo.isTooSoon) {
+        throw new Error(`Future flight schedules are only available for dates at least 7 days in the future. The earliest available date is ${dateValidation.dateInfo.minFutureDate}.`);
+      }
     }
 
-    // Initialize API parameters - these will be different based on the endpoint
+    // Initialize API parameters for flight search
     let apiParams = {
       access_key: API_KEY,
-      limit: 100
+      limit: 100,
+      dep_iata: originLocationCode,
+      arr_iata: destinationLocationCode,
+      flight_date: departureDate
     };
 
-    // Select appropriate endpoint and parameters based on whether this is a future request
+    // Log request type and configure the appropriate endpoint
     let endpointUrl;
     
-    if (isFutureRequest) {
-      console.log(`[AVIATION STACK] Requesting future flights for ${departureDate}`);
+    // Check if this is using the exact flightsFuture endpoint
+    if (isExactFutureEndpoint) {
+      console.log(`[AVIATION STACK] Using exact flightsFuture endpoint with original parameters`);
       endpointUrl = FLIGHTS_FUTURE_ENDPOINT;
       
-      // Set parameters for flightsFuture endpoint
-      if (originLocationCode) {
-        // For future flights, we need to specify if this is departure or arrival
-        apiParams.iataCode = originLocationCode;
-        apiParams.type = 'departure';  // We're searching from origin
+      // Important: Use the EXACT parameter names from the example URL
+      // http://api.aviationstack.com/v1/flightsFuture?iataCode=JFK&type=arrival&date=2025-07-06&access_key=...
+      apiParams = {
+        access_key: API_KEY,        // API key (required)
+        iataCode: iataCode,         // IATA code as provided in the request
+        type: type || 'arrival',    // 'arrival' or 'departure' as provided in the request
+        date: date                  // Date in YYYY-MM-DD format as provided in the request
+      };
+      
+      // Log the exact URL we're going to call (with masked key)
+      const urlWithParams = `${FLIGHTS_FUTURE_ENDPOINT}?iataCode=${iataCode}&type=${type || 'arrival'}&date=${date}&access_key=***`;
+      console.log(`[AVIATION STACK] Making API call to: ${urlWithParams}`);
+    }
+    // Regular future flight request using the standard format
+    else if (isFutureRequest) {
+      console.log(`[AVIATION STACK] Configuring future flight search for date ${departureDate}`);
+      endpointUrl = FLIGHTS_FUTURE_ENDPOINT;
+      
+      // Validate input parameters
+      if (!departureDate) {
+        throw new Error('Future flight search requires a valid departure date');
       }
       
-      if (departureDate) {
-        apiParams.date = departureDate;
+      // Default to arrival type based on the example URL
+      // http://api.aviationstack.com/v1/flightsFuture?iataCode=JFK&type=arrival&date=2025-07-06&access_key=...
+      const flightType = params.flightType || 'arrival';
+      
+      // Validate the future flight date is at least 7 days in the future
+      if (dateValidation && dateValidation.dateInfo.isTooSoon) {
+        throw new Error(`Future flight schedules are only available for dates at least 7 days in the future. The earliest available date is ${dateValidation.dateInfo.minFutureDate}.`);
       }
       
-      // Note: For flightsFuture, we'll filter for destination in memory after getting results
-      console.log(`[AVIATION STACK] Using flightsFuture endpoint with parameters:`, apiParams);
-    } else {
-      // For current/past flights, use the regular flights endpoint
-      endpointUrl = FLIGHTS_ENDPOINT;
+      // Set API parameters using the correct names to match the example URL
+      apiParams = {
+        access_key: API_KEY,                 // API key (required)
+        iataCode: originLocationCode,        // Airport IATA code (required)
+        type: flightType,                    // Type of schedule: 'arrival' or 'departure'
+        date: departureDate                  // Requested date in YYYY-MM-DD format
+      };
       
-      // Set parameters for flights endpoint
-      if (originLocationCode) {
-        apiParams.dep_iata = originLocationCode;
-      }
-      
+      // Add destination filtering if needed
       if (destinationLocationCode) {
-        apiParams.arr_iata = destinationLocationCode;
+        console.log(`[AVIATION STACK] Will filter future flight results for destination: ${destinationLocationCode}`);
       }
-      
-      if (departureDate) {
-        apiParams.flight_date = departureDate;
-      }
-      
-      console.log(`[AVIATION STACK] Using flights endpoint with parameters:`, apiParams);
+
+      // Log the future flight request
+      console.log(`[AVIATION STACK] Future flight request parameters:`, {
+        ...apiParams,
+        access_key: '***'
+      });
+    } else {
+      console.log(`[AVIATION STACK] Configuring current flight search for date ${departureDate}`);
+      endpointUrl = FLIGHTS_ENDPOINT; // Use flights endpoint for current flights
     }
 
-    // Prepare API request options
-    const requestOptions = {
-      params: apiParams,
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
+    // Log the request (with masked API key)
+    console.log(`[AVIATION STACK] Searching ${isFutureRequest ? 'future' : 'current'} flights with parameters:`, {
+      ...apiParams,
+      access_key: '***'
+    });
+
+    // Log the exact API call we're making (with masked API key)
+    const urlParams = new URLSearchParams({...apiParams, access_key: '***'});
+    console.log(`[AVIATION STACK] API URL: ${endpointUrl}?${urlParams.toString()}`);
+    
+    // Make the API request with the standard parameters
+    try {
+      const response = await makeApiRequestWithRetry(endpointUrl, {
+        params: apiParams,
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        }
+      });
+      
+      // Log successful response
+      console.log(`[AVIATION STACK] API request successful: HTTP ${response.status}`);
+
+      // Log raw API response for debugging
+      logRawApiResponse('flights', apiParams, response);
+
+      // Log response details
+      console.log(`[AVIATION STACK] Processing flight response:`, {
+        hasData: !!response.data?.data,
+        count: response.data?.data?.length || 0,
+        date: departureDate,
+        isFuture: isFutureRequest
+      });
+    } catch (requestError) {
+      // Handle specific errors for future flights API
+      if (isExactFutureEndpoint) {
+        console.error(`[AVIATION STACK] Error in future flights API call:`, requestError.message);
+        console.error(`[AVIATION STACK] Request URL: ${endpointUrl}`);
+        console.error(`[AVIATION STACK] Request Params:`, {...apiParams, access_key: '***'});
+        
+        if (requestError.response) {
+          console.error(`[AVIATION STACK] Response Status: ${requestError.response.status}`);
+          console.error(`[AVIATION STACK] Response Data:`, requestError.response.data);
+        }
+        
+        throw new Error(`Future flight API error: ${requestError.message}`);
       }
-    };
-    
-    // Initialize response variable
-    let response;
-    
-    // Make the API request to the appropriate endpoint
-    console.log(`[AVIATION STACK] Calling endpoint: ${endpointUrl}`);
-    response = await axios.get(endpointUrl, requestOptions);
+      
+      // Re-throw other errors
+      throw requestError;
+    }
 
-    // Log raw API response for debugging
-    logRawApiResponse(isFutureRequest ? 'flightsFuture' : 'flights', apiParams, response);
-
+    // Process the response the same way for both current and future flights
     if (!response.data?.data) {
       throw new Error('Invalid API response format');
     }
     
-    // For debugging future date responses
-    if (isFutureRequest) {
-      console.log(`[AVIATION STACK] Future flight response received for ${departureDate}`);
-      // Log the first few items to help with debugging
-      if (response.data.data && response.data.data.length > 0) {
-        console.log(`[AVIATION STACK] Found ${response.data.data.length} future flights`);
-        console.log(`[AVIATION STACK] Sample future flight:`, JSON.stringify(response.data.data[0]).substring(0, 200));
-        
-        // Log more details about flight structure (schema may differ for flightsFuture)
-        console.log(`[AVIATION STACK] Flight response structure example (first item):`);
-        const firstItem = response.data.data[0];
-        
-        // Handle potentially different response structure for flightsFuture endpoint
-        if (firstItem.flight_date) {
-          console.log(`  - Flight Date: ${firstItem.flight_date || 'N/A'}`);
-        }
-        
-        if (firstItem.flight) {
-          console.log(`  - Flight: ${firstItem.flight.iata || 'N/A'}`);
-        } else if (firstItem.flight_iata) {
-          console.log(`  - Flight: ${firstItem.flight_iata || 'N/A'}`);
-        }
-        
-        if (firstItem.departure) {
-          console.log(`  - Departure: ${firstItem.departure.scheduled || firstItem.departure.estimated || 'N/A'}`);
-        } else if (firstItem.departure_scheduled) {
-          console.log(`  - Departure: ${firstItem.departure_scheduled || 'N/A'}`);
-        }
-        
-        if (firstItem.arrival) {
-          console.log(`  - Arrival: ${firstItem.arrival.scheduled || firstItem.arrival.estimated || 'N/A'}`);
-        } else if (firstItem.arrival_scheduled) {
-          console.log(`  - Arrival: ${firstItem.arrival_scheduled || 'N/A'}`);
-        }
-      } else {
-        console.log(`[AVIATION STACK] No future flights found in API response`);
-        
-        // Check if there's any specific message about future flight data
-        if (response.data.error) {
-          console.log(`[AVIATION STACK] Error from API for future flights:`, response.data.error);
-        }
+    // Log flight results for any date
+    console.log(`[AVIATION STACK] Processing flight data for date ${departureDate}`);
+    if (response.data.data && response.data.data.length > 0) {
+      console.log(`[AVIATION STACK] Found ${response.data.data.length} flights for date ${departureDate}`);
+    } else {
+      console.log(`[AVIATION STACK] No flights found for date ${departureDate}`);
+      
+      // Check if there's any specific message from the API
+      if (response.data.error) {
+        console.log(`[AVIATION STACK] Error from API:`, response.data.error);
       }
     }
     
@@ -330,166 +714,91 @@ const searchFlights = async (params) => {
     // Get the raw flight data from the response
     let flightsData = response.data.data;
     
-    // Handle different response formats between endpoints
-    if (isFutureRequest) {
-      console.log(`[AVIATION STACK] Processing flightsFuture response data format`);
+    // Add logging for response data structure
+    console.log(`[AVIATION STACK] Response data structure:`, {
+      hasData: !!response.data.data,
+      dataLength: response.data.data?.length,
+      firstItemKeys: response.data.data?.[0] ? Object.keys(response.data.data[0]) : []
+    });
+    
+    // Filter flights for the specified route if needed
+    if (originLocationCode && destinationLocationCode) {
+      console.log(`[AVIATION STACK] Filtering flights for route ${originLocationCode} to ${destinationLocationCode}`);
       
-      // If we're searching for a specific destination, filter the future flights
-      if (destinationLocationCode) {
-        console.log(`[AVIATION STACK] Filtering future flights for destination: ${destinationLocationCode}`);
+      // Filter flights to match origin and destination
+      if (isFutureRequest) {
+        console.log(`[AVIATION STACK] Filtering future flights for route: ${originLocationCode} → ${destinationLocationCode}`);
+        
+        // For future flights, we need to check both origin and destination
         flightsData = flightsData.filter(flight => {
-          // The structure for flightsFuture endpoint has arrival.iataCode
-          const arrivalIata = flight.arrival?.iataCode || flight.arrival?.iata || flight.destination_iata || flight.arr_iata;
+          // Extract origin and destination IATA codes from the flight data
+          // Handle different field naming conventions from the API
+          const originIata = (
+            flight.departure?.iataCode || 
+            flight.departure?.iata || 
+            flight.departureIata || 
+            ''
+          ).toLowerCase();
           
-          // Check for match using case-insensitive comparison
-          const isMatch = arrivalIata && arrivalIata.toLowerCase() === destinationLocationCode.toLowerCase();
-          console.log(`[AVIATION STACK] Flight filter check: ${arrivalIata} === ${destinationLocationCode}: ${isMatch}`);
-          return isMatch;
+          const destIata = (
+            flight.arrival?.iataCode || 
+            flight.arrival?.iata || 
+            flight.arrivalIata || 
+            ''
+          ).toLowerCase();
+          
+          // Normalize input codes for comparison
+          const originCode = originLocationCode.toLowerCase();
+          const destCode = destinationLocationCode.toLowerCase();
+          
+          // Check if origin and destination match
+          const originMatch = originIata === originCode;
+          const destMatch = destIata === destCode;
+          
+          // Log the match results for debugging
+          console.log(`[AVIATION STACK] Future flight origin check: ${originIata} === ${originCode}: ${originMatch}`);
+          console.log(`[AVIATION STACK] Future flight destination check: ${destIata} === ${destCode}: ${destMatch}`);
+          
+          // For future flights, we want flights that match both origin and destination
+          return originMatch && destMatch;
+        });
+      } else {
+        // Current flight filtering - ensure consistent handling of IATA codes
+        flightsData = flightsData.filter(flight => {
+          const originIata = (flight.departure?.iata || '').toLowerCase();
+          const destIata = (flight.arrival?.iata || '').toLowerCase();
+          
+          const originCode = originLocationCode.toLowerCase();
+          const destCode = destinationLocationCode.toLowerCase();
+          
+          const originMatch = originIata === originCode;
+          const destMatch = destIata === destCode;
+          
+          console.log(`[AVIATION STACK] Current flight origin check: ${originIata} === ${originCode}: ${originMatch}`);
+          console.log(`[AVIATION STACK] Current flight destination check: ${destIata} === ${destCode}: ${destMatch}`);
+          
+          return originMatch && destMatch;
         });
       }
-    } else {
-      // For regular flights endpoint, filter as before
-      if (originLocationCode && destinationLocationCode) {
-        console.log(`[AVIATION STACK] Filtering flights for route ${originLocationCode} to ${destinationLocationCode}`);
-        flightsData = flightsData.filter(flight => 
-          flight.departure?.iata?.toLowerCase() === originLocationCode.toLowerCase() &&
-          flight.arrival?.iata?.toLowerCase() === destinationLocationCode.toLowerCase()
-        );
-      }
+      
+      console.log(`[AVIATION STACK] Found ${flightsData.length} flights for route ${originLocationCode} to ${destinationLocationCode}`);
     }
     
-    // The response structure might be different between flights and flightsFuture endpoints
-    // So we need to normalize the data to our standard format
+    // Map flights using the standard mapper
     const flights = flightsData.map(flight => {
-      // Create a normalized flight object that works with both endpoints
-      let flightObj;
-      
+      // Ensure isFutureRequest is passed correctly
+      const mappedFlight = mapFlightResponse(flight, isFutureRequest);
+      console.log(`[AVIATION STACK] Mapped flight (isFutureRequest=${isFutureRequest}):`, JSON.stringify(mappedFlight).substring(0, 200));
+      return mappedFlight;
+    });
+    
+    // Add schedule information
+    flights.forEach(flight => {
+      flight.isScheduleData = true;
+      // Set isFutureFlight based on the determined isFutureRequest flag
       if (isFutureRequest) {
-        // Handle flightsFuture endpoint response format
-        // The structure is different from the regular flights endpoint
-        console.log(`[AVIATION STACK] Mapping flightsFuture data: ${JSON.stringify(flight).substring(0, 200)}...`);
-        
-        // Extract airline and flight information
-        // For flightsFuture, we might have airline.name directly 
-        const airlineName = flight.airline?.name || flight.airline_name || 'Unknown Airline';
-        
-        // Generate a flight number if not available
-        const airlineCode = flight.airline?.iataCode || flight.airline?.iata || 'UNK';
-        const flightNumber = flight.flight?.number || flight.flight_number || '000';
-        const flightIata = `${airlineCode}${flightNumber}`;
-        
-        // Extract departure information - flightsFuture uses iataCode instead of iata
-        const depIata = flight.departure?.iataCode || flight.departure?.iata || flight.departure_iata || flight.dep_iata || originLocationCode;
-        const depAirport = flight.departure?.airport || flight.departure_airport || 'Unknown Airport';
-        const depCity = flight.departure?.city || flight.departure_city || '';
-        const depCountry = flight.departure?.country || flight.departure_country || '';
-        const depTerminal = flight.departure?.terminal || flight.departure_terminal || null;
-        const depGate = flight.departure?.gate || flight.departure_gate || null;
-        
-        // Extract arrival information - flightsFuture uses iataCode instead of iata
-        const arrIata = flight.arrival?.iataCode || flight.arrival?.iata || flight.arrival_iata || flight.arr_iata || destinationLocationCode;
-        const arrAirport = flight.arrival?.airport || flight.arrival_airport || 'Unknown Airport';
-        const arrCity = flight.arrival?.city || flight.arrival_city || '';
-        const arrCountry = flight.arrival?.country || flight.arrival_country || '';
-        const arrTerminal = flight.arrival?.terminal || flight.arrival_terminal || null;
-        const arrGate = flight.arrival?.gate || flight.arrival_gate || null;
-        
-        // Extract scheduled timestamps for future flights
-        const depScheduled = flight.departure?.scheduled || flight.departure_scheduled || new Date().toISOString();
-        const arrScheduled = flight.arrival?.scheduled || flight.arrival_scheduled || new Date().toISOString();
-        const flightDate = flight.flight_date || departureDate || new Date(depScheduled).toISOString().split('T')[0];
-        
-        flightObj = {
-          id: flightIata,
-          airline: airlineName,
-          flightNumber: flightIata,
-          origin: {
-            iataCode: depIata,
-            name: depAirport,
-            city: depCity,
-            country: depCountry,
-            terminal: depTerminal,
-            gate: depGate
-          },
-          destination: {
-            iataCode: arrIata,
-            name: arrAirport,
-            city: arrCity,
-            country: arrCountry,
-            terminal: arrTerminal,
-            gate: arrGate
-          },
-          departureDate: flightDate,
-          departureTime: new Date(depScheduled).toLocaleTimeString('en-US', {
-            hour: '2-digit',
-            minute: '2-digit',
-            hour12: false
-          }),
-          arrivalDate: new Date(arrScheduled).toISOString().split('T')[0],
-          arrivalTime: new Date(arrScheduled).toLocaleTimeString('en-US', {
-            hour: '2-digit',
-            minute: '2-digit',
-            hour12: false
-          }),
-          duration: calculateDuration(depScheduled, arrScheduled),
-          status: flight.flight_status || flight.status || 'scheduled',
-          aircraft: flight.aircraft?.modelCode || flight.aircraft?.iata || flight.aircraft_iata || null,
-          delay: {
-            departure: flight.departure?.delay || null,
-            arrival: flight.arrival?.delay || null
-          },
-          isScheduleData: true,
-          weekday: flight.weekday || null
-        };
-      } else {
-        // Handle regular flights endpoint response format
-        flightObj = {
-          id: flight.flight?.iata || `${flight.airline?.iata || 'UNK'}${flight.flight?.number || '000'}`,
-          airline: flight.airline?.name || 'Unknown Airline',
-          flightNumber: flight.flight?.iata || `${flight.airline?.iata || 'UNK'}${flight.flight?.number || '000'}`,
-          origin: {
-            iataCode: flight.departure.iata,
-            name: flight.departure.airport,
-            city: flight.departure.city || '',
-            country: flight.departure.country || '',
-            terminal: flight.departure.terminal,
-            gate: flight.departure.gate
-          },
-          destination: {
-            iataCode: flight.arrival.iata,
-            name: flight.arrival.airport,
-            city: flight.arrival.city || '',
-            country: flight.arrival.country || '',
-            terminal: flight.arrival.terminal,
-            gate: flight.arrival.gate
-          },
-          departureDate: flight.flight_date,
-          departureTime: new Date(flight.departure.scheduled).toLocaleTimeString('en-US', {
-            hour: '2-digit',
-            minute: '2-digit',
-            hour12: false
-          }),
-          arrivalDate: new Date(flight.arrival.scheduled).toISOString().split('T')[0],
-          arrivalTime: new Date(flight.arrival.scheduled).toLocaleTimeString('en-US', {
-            hour: '2-digit',
-            minute: '2-digit',
-            hour12: false
-          }),
-          duration: calculateDuration(
-            flight.departure.scheduled,
-            flight.arrival.scheduled
-          ),
-          status: flight.flight_status,
-          aircraft: flight.aircraft?.iata,
-          delay: {
-            departure: flight.departure?.delay || null,
-            arrival: flight.arrival?.delay || null
-          },
-          isScheduleData: false
-        };
+        flight.isFutureFlight = true;
       }
-      
-      return flightObj;
     });
 
     console.log(`[AVIATION STACK] Found ${flights.length} flights for route ${originLocationCode || '*'} to ${destinationLocationCode || '*'}`);
@@ -498,6 +807,9 @@ const searchFlights = async (params) => {
     if (flights.length > 0) {
         console.log(`[AVIATION STACK] Sample flight after mapping:`, JSON.stringify(flights[0]).substring(0, 300));
     }
+    
+    // Ensure we provide a clear count in logs
+    console.log(`[AVIATION STACK] Final flight count after mapping and filtering: ${flights.length}`);
     
     // Add context about why flights might not be found
     let emptyResultContext = null;
@@ -515,7 +827,14 @@ const searchFlights = async (params) => {
       
       // Add date-specific reasons
       if (dateValidation) {
-        if (dateValidation.status === 'far_future') {
+        if (dateValidation.status === 'too_soon') {
+          emptyResultContext.possibleReasons.unshift(
+            `The requested date is too soon for future flight API (minimum date is ${dateValidation.dateInfo.minFutureDate})`
+          );
+          emptyResultContext.suggestions.unshift(
+            `Try a date after ${dateValidation.dateInfo.minFutureDate} for future flight searches`
+          );
+        } else if (dateValidation.status === 'far_future') {
           emptyResultContext.possibleReasons.unshift(
             "The requested date is too far in the future (beyond typical 11-month airline scheduling window)"
           );
@@ -531,50 +850,114 @@ const searchFlights = async (params) => {
           );
         } else if (dateValidation.dateCategory === 'future') {
           emptyResultContext.possibleReasons.unshift(
-            "Airline schedules may not be fully published for this date yet"
+            "Using paid tier AviationStack API to search future flights, but no flights were found"
           );
           emptyResultContext.suggestions.unshift(
-            `Try a date within the next 7 days (before ${dateValidation.dateInfo.nearTermDate})`
+            "Try another date or check if this route operates on this date"
           );
         }
       }
     }
     
-    // Return a structured response with both flights and API metadata
-    return {
-      flights: flights,
-      apiResponse: apiResponseMetadata,
-      apiRequestParams: {
-        originLocationCode,
-        destinationLocationCode,
-        departureDate,
-        searchTimestamp: new Date().toISOString()
-      },
-      dateValidation: dateValidation,
-      emptyResultContext: emptyResultContext
+    // Prepare the structured response with both flights and API metadata
+    const result = {
+      flights,  // This is the processed flights array
+      apiResponse: {
+        total: apiResponseMetadata.total,
+        limit: apiResponseMetadata.limit,
+        offset: apiResponseMetadata.offset,
+        count: flights.length,
+        source: 'AviationStack API',
+        timestamp: new Date().toISOString()
+      }
     };
+    
+    // Add dateValidation if available
+    if (dateValidation) {
+      result.dateValidation = dateValidation;
+    }
+    
+    // Add empty result context if no flights were found
+    if (emptyResultContext) {
+      result.emptyResultContext = emptyResultContext;
+    }
+    
+    // Add request parameters for debugging/tracking
+    result.apiRequestParams = {
+      originLocationCode,
+      destinationLocationCode,
+      departureDate,
+      travelClass,
+      searchTimestamp: new Date().toISOString()
+    };
+    
+    // Cache the result with appropriate TTL
+    const ttl = isFutureRequest ? CACHE_TTL_FUTURE_FLIGHTS : CACHE_TTL_CURRENT_FLIGHTS;
+    flightCache.set(cacheKey, result, ttl);
+    
+    return result;
 
   } catch (error) {
     console.error('[AVIATION STACK] Flight search error:', error.response?.data || error.message);
     
-    // Special handling for future date API errors
-    if (departureDate) {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const requestDate = new Date(departureDate);
-      requestDate.setHours(0, 0, 0, 0);
+    // Detailed error logging, especially for the flightsFuture endpoint
+    // isFutureRequest is guaranteed to be defined here because we moved its definition to the top of the function
+    if (isExactFutureEndpoint || isFutureRequest) {
+      console.error(`[AVIATION STACK] Error occurred when calling future flights API (isFutureRequest=${isFutureRequest}, isExactFutureEndpoint=${isExactFutureEndpoint}):`);
       
-      if (requestDate > today) {
-        console.error('[AVIATION STACK] Error fetching future flight data:', error.message);
+      if (error.response) {
+        console.error(`- Status: ${error.response.status}`);
+        console.error(`- Status Text: ${error.response.statusText}`);
+        console.error(`- Data:`, error.response.data);
         
-        // Check for specific error codes related to future schedules
-        if (error.response?.data?.error) {
+        // Log the request URL and parameters for debugging
+        if (error.config) {
+          const safeParams = {...error.config.params};
+          if (safeParams.access_key) safeParams.access_key = '***';
+          
+          console.error(`- Request URL: ${error.config.url}`);
+          console.error(`- Request Params:`, safeParams);
+        }
+      }
+    }
+    
+    // Special handling for future date API errors - using the already determined isFutureRequest flag
+    if (isFutureRequest) {
+      console.error('[AVIATION STACK] Error fetching future flight data:', error.message);
+      
+      // Determine which date parameter was used
+      const dateParam = date || departureDate;
+      
+      // Check for specific error codes related to future schedules
+      if (error.response?.data?.error) {
           const apiError = error.response.data.error;
           
-          if (apiError.code === 'out_of_schedule_range' || 
+          // Handle validation errors specifically
+          if (apiError.code === 'validation_error') {
+            console.error('[AVIATION STACK] Validation error details:', apiError.context || {});
+            
+            // Construct a helpful message based on validation context
+            let validationMsg = 'Request failed with validation error';
+            
+            if (apiError.context && apiError.context.date) {
+              validationMsg = `Date validation error: ${apiError.context.date.join(', ')}`;
+            } else if (apiError.context && apiError.context.iataCode) {
+              validationMsg = `IATA code validation error: ${apiError.context.iataCode.join(', ')}`;
+            } else if (apiError.context && apiError.context.type) {
+              validationMsg = `Flight type validation error: ${apiError.context.type.join(', ')}`;
+            }
+            
+            // Log recommended format for debugging
+            console.error('[AVIATION STACK] Recommended API format for future flights:');
+            console.error('http://api.aviationstack.com/v1/flightsFuture?iataCode=JFK&type=arrival&date=2025-07-06');
+            
+            throw new Error(`Future flight validation error: ${validationMsg}. Please ensure the date is in YYYY-MM-DD format and not too far in the future.`);
+          }
+          else if (apiError.code === 'out_of_schedule_range' || 
               apiError.code === 'schedule_not_available' ||
               apiError.code === 'invalid_access_key' ||
               apiError.code === 'usage_limit_reached' ||
+              apiError.code === 'rate_limit_reached' ||
               apiError.message?.includes('schedule') ||
               apiError.message?.includes('future')) {
             
@@ -582,24 +965,62 @@ const searchFlights = async (params) => {
             console.error('[AVIATION STACK] Detailed future flight API error:', {
               code: apiError.code,
               message: apiError.message,
-              endpoint: 'flightsFuture',
-              date: departureDate
+              endpoint: isExactFutureEndpoint ? 'flightsFuture' : 'flights',
+              date: date || departureDate
             });
             
-            throw new Error(`Future flight schedule error: ${apiError.message}`);
+            // Add helpful error messages for specific error codes
+            if (apiError.code === 'out_of_schedule_range') {
+              throw new Error(`The requested date (${dateParam}) is outside the available schedule range. Please try a date within the next 11 months.`);
+            } else if (apiError.code === 'schedule_not_available') {
+              throw new Error(`Flight schedules are not available for the date ${dateParam}. Airlines typically publish schedules 7 days to 11 months in advance.`);
+            } else if (apiError.code === 'invalid_access_key') {
+              throw new Error(`Your API key for AviationStack is invalid or has insufficient permissions for future flight searches. Future flight searches require the paid tier.`);
+            } else {
+              throw new Error(`Future flight schedule error: ${apiError.message}`);
+            }
           }
         } else {
           // Provide more helpful error message for future flight data issues
           console.error('[AVIATION STACK] Unspecified future flight API error:', {
             message: error.message,
-            endpoint: 'flightsFuture',
-            date: departureDate
+            endpoint: isExactFutureEndpoint ? 'flightsFuture' : 'flights',
+            date: dateParam,
+            isFutureRequest: isFutureRequest,
+            requestParams: isExactFutureEndpoint ? 
+              { iataCode, type, date } : 
+              { originLocationCode, destinationLocationCode, departureDate }
           });
           
-          throw new Error(`Error fetching flights for future date (${departureDate}): ${error.message}. 
-          This may be due to future flight data limitations in the current API tier or the date being too far in the future.`);
+          const dateInfo = dateParam ? `(${dateParam})` : '';
+          throw new Error(`Error fetching flights for future date ${dateInfo}: ${error.message}. 
+          The API may have limitations or the date may be outside the valid range. Future flight searches require the AviationStack paid tier API.`);
         }
       }
+    }
+    
+    // Provide detailed error messages for rate limit issues
+    if (isRateLimitError(error)) {
+      const retryAfter = error.response?.headers?.['retry-after'] || 
+                         error.response?.headers?.['Retry-After'] || 
+                         '60';
+      
+      // Try to parse retry-after header
+      let retryTime;
+      try {
+        retryTime = parseInt(retryAfter, 10);
+        // Convert to minutes if it's in seconds
+        if (retryTime > 180) {
+          retryTime = Math.ceil(retryTime / 60);
+          retryTime = `${retryTime} minutes`;
+        } else {
+          retryTime = `${retryTime} seconds`;
+        }
+      } catch (e) {
+        retryTime = '1 minute';
+      }
+      
+      throw new Error(`Rate limit reached. Please try again in ${retryTime}. Consider reducing the frequency of requests or upgrading your API plan for higher limits.`);
     }
     
     throw new Error(`Failed to search flights: ${error.message}`);
@@ -619,8 +1040,10 @@ const getServiceStatus = () => {
     features: {
       realTimeFlights: true,
       historicalFlights: true,
-      futureFlights: true, // Now supported with flightsFuture endpoint
+      futureFlights: true, // Supported with flightsFuture endpoint for future dates
       pricing: false, // AviationStack doesn't provide pricing data
+      caching: true, // We've implemented caching
+      rateLimitHandling: true, // We've implemented rate limit handling
       airportInfo: true,
       flightStatus: true
     },
@@ -632,8 +1055,38 @@ const getServiceStatus = () => {
   };
 };
 
+/**
+ * Clears the flight cache
+ * @returns {Object} Information about the cleared cache
+ */
+const clearCache = () => {
+  const stats = flightCache.getStats();
+  flightCache.flushAll();
+  return {
+    cleared: true,
+    previousStats: stats,
+    timestamp: new Date().toISOString()
+  };
+};
+
+/**
+ * Gets cache statistics
+ * @returns {Object} Cache statistics
+ */
+const getCacheStats = () => {
+  return {
+    ...flightCache.getStats(),
+    timestamp: new Date().toISOString(),
+    maxSize: CACHE_MAX_SIZE,
+    ttlCurrentFlights: CACHE_TTL_CURRENT_FLIGHTS,
+    ttlFutureFlights: CACHE_TTL_FUTURE_FLIGHTS
+  };
+};
+
 module.exports = {
   searchAirports,
   searchFlights,
-  getServiceStatus
+  getServiceStatus,
+  clearCache,
+  getCacheStats
 };
