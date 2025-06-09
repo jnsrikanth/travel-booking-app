@@ -4,23 +4,42 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:clean": "npx kill-port 3000 && next dev",
+    "start:all": "./start-app.sh",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "jest",
+    "test:watch": "jest --watch"
   },
   "dependencies": {
-    "@types/axios": "^0.9.36",
+    "@types/lodash": "^4.17.17",
+    "@upstash/redis": "^1.35.0",
     "axios": "^1.9.0",
+    "bcrypt": "^6.0.0",
+    "colors": "^1.4.0",
     "dotenv": "^16.5.0",
-    "next": "14.0.4",
+    "ioredis": "^5.6.1",
+    "lodash": "^4.17.21",
+    "mysql2": "^3.14.1",
+    "next": "^14.2.29",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "react-hot-toast": "^2.4.1"
+    "react-hot-toast": "^2.4.1",
+    "redis": "^5.5.6"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/bcrypt": "^5.0.2",
+    "@types/jest": "^29.5.14",
     "@types/node": "^20.10.0",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
     "autoprefixer": "^10.4.16",
+    "eslint": "^9.28.0",
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^30.0.0-beta.3",
     "postcss": "^8.4.32",
     "tailwindcss": "^3.3.0",
     "typescript": "^5.3.0"

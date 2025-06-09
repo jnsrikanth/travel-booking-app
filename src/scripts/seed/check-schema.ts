@@ -7,11 +7,12 @@
  * - Ensures foreign key constraints and indexes are in place
  */
 
-import { executeQuery, getPool, withConnection } from '../../lib/db';
+import dbUtils from '../../lib/db'; // Use default import
 import chalk from 'chalk';
 
 // Initialize the DB connection
-const pool = getPool();
+const { getPool, executeQuery, closePool } = dbUtils; // Destructure needed functions
+const pool = getPool(); // This pool is 'any' as per db.ts, direct usage might be fine or need casting
 
 // Logging utility
 const log = {
@@ -43,15 +44,15 @@ async function validateDatabaseSchema() {
     
     log.success('Database schema validation completed successfully');
     
-    // Close pool
-    await pool.end();
+    // Close pool using the utility from db.ts
+    await closePool();
     
   } catch (error) {
     log.error(`Database schema validation failed: ${error}`);
     
     // Close pool even if there's an error
     try {
-      await pool.end();
+      await closePool(); // Use the utility here as well
     } catch (err) {
       log.error(`Failed to close database pool: ${err}`);
     }

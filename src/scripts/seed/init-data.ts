@@ -9,13 +9,25 @@
  * - Initial system settings
  */
 
-import { executeQuery, executeTransaction, getPool, withConnection } from '../../lib/db';
+import dbUtils from '../../lib/db'; // Use default import
 import { batchInsert, insertRecord } from '../../lib/mysql';
 import * as bcrypt from 'bcrypt';
 import chalk from 'chalk';
+import { RowDataPacket, OkPacket } from 'mysql2';
+
+// Define types for rows that will be fetched
+interface CountResult extends RowDataPacket { count: number; }
+interface CountryCodeRow extends RowDataPacket { id: number; code: string; }
+interface CityRow extends RowDataPacket { id: number; name: string; country_id: number; }
+interface AirportCodeRow extends RowDataPacket { id: number; code: string; }
+interface RouteRow extends RowDataPacket { id: number; origin_airport_id: number; destination_airport_id: number; flight_time_minutes: number; }
+interface AirlineRow extends RowDataPacket { id: number; code: string; }
+interface AircraftRow extends RowDataPacket { id: number; model: string; }
+
 
 // Initialize the DB connection
-const pool = getPool();
+const { getPool, executeQuery, closePool } = dbUtils; // Destructure needed functions
+const pool = getPool(); // This pool is 'any' as per db.ts
 
 // Configuration
 const SALT_ROUNDS = 10;
@@ -77,15 +89,15 @@ async function initializeDatabase() {
     
     log.success('Database initialization completed successfully');
     
-    // Close pool
-    await pool.end();
+    // Close pool using the utility from db.ts
+    await closePool();
     
   } catch (error) {
     log.error(`Database initialization failed: ${error}`);
     
     // Close pool even if there's an error
     try {
-      await pool.end();
+      await closePool(); // Use the utility here as well
     } catch (err) {
       log.error(`Failed to close database pool: ${err}`);
     }
@@ -116,7 +128,7 @@ async function populateCountriesAndCities() {
     log.step('Populating countries and cities');
     
     // Check if countries already exist
-    const existingCountries = await executeQuery<any[]>('SELECT COUNT(*) as count FROM countries');
+    const existingCountries = await executeQuery<CountResult[]>('SELECT COUNT(*) as count FROM countries');
     if (existingCountries[0].count > 0) {
       log.warning('Countries already exist in the database. Skipping countries and cities creation.');
       return;
@@ -146,7 +158,7 @@ async function populateCountriesAndCities() {
     log.success(`Inserted ${countryIds.length} countries`);
     
     // Map country codes to IDs
-    const countryCodeToId = {};
+    const countryCodeToId: { [key: string]: number } = {};
     for (let i = 0; i < countries.length; i++) {
       countryCodeToId[countries[i].code] = countryIds[i];
     }
@@ -215,20 +227,22 @@ async function populateAirports() {
     log.step('Populating airports');
     
     // Check if airports already exist
-    const existingAirports = await executeQuery<any[]>('SELECT COUNT(*) as count FROM airports');
+    const existingAirports = await executeQuery<CountResult[]>('SELECT COUNT(*) as count FROM airports');
     if (existingAirports[0].count > 0) {
       log.warning('Airports already exist in the database. Skipping airports creation.');
       return;
     }
     
     // Get cities from database to map names to IDs
-    const citiesResult = await executeQuery<any[]>('SELECT id, name, country_id FROM cities');
+    const citiesResult = await executeQuery<CityRow[]>('SELECT id, name, country_id FROM cities');
     const cities = citiesResult;
     
     // Map city names to IDs
-    const cityNameToId = {};
+    const cityNameToId: { [key: string]: number } = {};
     cities.forEach(city => {
-      cityNameToId[city.name] = city.id;
+      if (city.name) { // Ensure city.name is not undefined/null before using as key
+        cityNameToId[city.name] = city.id;
+      }
     });
     
     // Major global airports - [code, name, city_name, latitude, longitude]
@@ -308,7 +322,7 @@ async function setupCurrenciesAndPaymentMethods() {
     log.step('Setting up currencies and payment methods');
     
     // Check if currencies already exist
-    const existingCurrencies = await executeQuery<any[]>('SELECT COUNT(*) as count FROM currencies');
+    const existingCurrencies = await executeQuery<CountResult[]>('SELECT COUNT(*) as count FROM currencies');
     if (existingCurrencies[0].count > 0) {
       log.warning('Currencies already exist in the database. Skipping currencies creation.');
     } else {
@@ -342,7 +356,7 @@ async function setupCurrenciesAndPaymentMethods() {
     }
     
     // Check if payment methods already exist
-    const existingPaymentMethods = await executeQuery<any[]>('SELECT COUNT(*) as count FROM payment_methods');
+    const existingPaymentMethods = await executeQuery<CountResult[]>('SELECT COUNT(*) as count FROM payment_methods');
     if (existingPaymentMethods[0].count > 0) {
       log.warning('Payment methods already exist in the database. Skipping payment methods creation.');
     } else {
@@ -387,7 +401,7 @@ async function createAirlinesAndAircraft() {
     log.step('Creating airlines and aircraft');
     
     // Check if airlines already exist
-    const existingAirlines = await executeQuery<any[]>('SELECT COUNT(*) as count FROM airlines');
+    const existingAirlines = await executeQuery<CountResult[]>('SELECT COUNT(*) as count FROM airlines');
     if (existingAirlines[0].count > 0) {
       log.warning('Airlines already exist in the database. Skipping airlines creation.');
     } else {
@@ -417,10 +431,12 @@ async function createAirlinesAndAircraft() {
       ];
       
       // Get country IDs
-      const countriesResult = await executeQuery<any[]>('SELECT id, code FROM countries');
-      const countryCodeToId = {};
+      const countriesResult = await executeQuery<CountryCodeRow[]>('SELECT id, code FROM countries');
+      const countryCodeToId: { [key: string]: number } = {};
       countriesResult.forEach(country => {
-        countryCodeToId[country.code] = country.id;
+        if (country.code) { // Ensure country.code is not undefined/null
+          countryCodeToId[country.code] = country.id;
+        }
       });
       
       // Convert to airline objects
@@ -447,7 +463,7 @@ async function createAirlinesAndAircraft() {
     }
     
     // Check if aircraft already exist
-    const existingAircraft = await executeQuery<any[]>('SELECT COUNT(*) as count FROM aircraft');
+    const existingAircraft = await executeQuery<CountResult[]>('SELECT COUNT(*) as count FROM aircraft');
     if (existingAircraft[0].count > 0) {
       log.warning('Aircraft already exist in the database. Skipping aircraft creation.');
     } else {
@@ -493,17 +509,20 @@ async function createFlightRoutes() {
     log.step('Creating flight routes');
     
     // Check if routes already exist
-    const existingRoutes = await executeQuery<any[]>('SELECT COUNT(*) as count FROM routes');
+    const existingRoutes = await executeQuery<CountResult[]>('SELECT COUNT(*) as count FROM routes');
     if (existingRoutes[0].count > 0) {
       log.warning('Routes already exist in the database. Skipping routes creation.');
       return;
     }
     
     // Get airports from database
-    const airportsResult = await executeQuery<any[]>('SELECT id, code FROM airports');
-    const airportCodeToId = {};
+    interface AirportCodeRow extends RowDataPacket { id: number; code: string; }
+    const airportsResult = await executeQuery<AirportCodeRow[]>('SELECT id, code FROM airports');
+    const airportCodeToId: { [key: string]: number } = {};
     airportsResult.forEach(airport => {
-      airportCodeToId[airport.code] = airport.id;
+      if (airport.code) {
+        airportCodeToId[airport.code] = airport.id;
+      }
     });
     
     // Popular routes - [origin_code, destination_code, distance_km, flight_time_minutes]
@@ -611,19 +630,19 @@ async function generateSampleFlights() {
     const routesResult = await executeQuery<any[]>('SELECT id, origin_airport_id, destination_airport_id, flight_time_minutes FROM routes');
     
     // Get airports for code lookup
-    const airportsResult = await executeQuery<any[]>('SELECT id, code FROM airports');
-    const airportIdToCode = {};
-    airportsResult.forEach(airport => {
+    const airportsResultForIdMap = await executeQuery<AirportCodeRow[]>('SELECT id, code FROM airports');
+    const airportIdToCode: { [key: number]: string } = {};
+    airportsResultForIdMap.forEach(airport => {
       airportIdToCode[airport.id] = airport.code;
     });
     
     // Get airlines
-    const airlinesResult = await executeQuery<any[]>('SELECT id, code FROM airlines');
-    const airlines = airlinesResult;
+    const airlinesResultFromDb = await executeQuery<AirlineRow[]>('SELECT id, code FROM airlines');
+    const airlines = airlinesResultFromDb;
     
     // Get aircraft
-    const aircraftResult = await executeQuery<any[]>('SELECT id, model FROM aircraft');
-    const aircraft = aircraftResult;
+    const aircraftResultFromDb = await executeQuery<AircraftRow[]>('SELECT id, model FROM aircraft');
+    const aircraft = aircraftResultFromDb;
     
     // Create flights for the next 60 days
     const startDate = new Date();
@@ -635,12 +654,18 @@ async function generateSampleFlights() {
     const flightSchedules = [];
     
     // For each route, create flights
+    // Assuming routesResult is defined in an outer scope or fetched earlier.
+    // If routesResult is from a query like: const routesResult = await executeQuery<RouteRow[]>(...);
+    // Assuming routesResult is defined from a previous query like:
+    // const routesResult = await executeQuery<RouteRow[]>('SELECT id, origin_airport_id, destination_airport_id, flight_time_minutes FROM routes');
+    // This line is already present at line 630 in the latest file content.
+    // const routesResult = await executeQuery<RouteRow[]>('SELECT id, origin_airport_id, destination_airport_id, flight_time_minutes FROM routes');
+
     for (const route of routesResult) {
-      // Origin and destination airport codes for flight number
       const originCode = airportIdToCode[route.origin_airport_id];
       const destCode = airportIdToCode[route.destination_airport_id];
       
-      // Assign random airline and aircraft to this route
+      // 'airlines' and 'aircraft' are now directly the results of executeQuery
       const airline = airlines[Math.floor(Math.random() * airlines.length)];
       const selectedAircraft = aircraft[Math.floor(Math.random() * aircraft.length)];
       

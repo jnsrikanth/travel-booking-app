@@ -1,6 +1,7 @@
 import { executeQuery, getConnection } from '../../lib/db';
+import { RowDataPacket, OkPacket } from 'mysql2';
 
-interface Country {
+interface Country extends RowDataPacket {
   id: number;
   name: string;
   code: string;
@@ -105,7 +106,7 @@ async function seedCountries(): Promise<Map<string, number>> {
   const countryMap = new Map<string, number>();
   
   // Check which countries already exist
-  const existingCountries = await executeQuery<{ id: number, code: string }[]>(
+  const existingCountries = await executeQuery<Country[]>(
     'SELECT id, code FROM countries'
   );
   
@@ -117,11 +118,15 @@ async function seedCountries(): Promise<Map<string, number>> {
   // Insert countries that don't exist yet
   for (const country of countriesData) {
     if (!countryMap.has(country.code)) {
-      const result = await executeQuery<any>(
+      // For INSERT, the result is OkPacket or ResultSetHeader, not Country[]
+      // Let's use a more appropriate type or 'any' if the structure is not critical here.
+      // OkPacket is a good choice for insert results.
+      const result = await executeQuery<OkPacket>(
         'INSERT INTO countries (name, code) VALUES (?, ?)',
         [country.name, country.code]
       );
       
+      // OkPacket has insertId
       if (result && result.insertId) {
         countryMap.set(country.code, result.insertId);
         console.log(`Added country: ${country.name}`);
@@ -266,7 +271,9 @@ async function seedCities(countryMap: Map<string, number>): Promise<Map<string, 
   const cityMap = new Map<string, number>();
   
   // Check which cities already exist
-  const existingCities = await executeQuery<{ id: number, country_id: number, name: string }[]>(
+  // Define CityRow extending RowDataPacket if not already done, or use an inline type
+  interface CityRow extends RowDataPacket { id: number; country_id: number; name: string; }
+  const existingCities = await executeQuery<CityRow[]>(
     'SELECT id, country_id, name FROM cities'
   );
   
@@ -285,7 +292,7 @@ async function seedCities(countryMap: Map<string, number>): Promise<Map<string, 
       const key = `${countryId}-${city.name}`;
       
       if (!existingCityMap.has(key)) {
-        const result = await executeQuery<any>(
+        const result = await executeQuery<OkPacket>(
           'INSERT INTO cities (country_id, name, timezone) VALUES (?, ?, ?)',
           [countryId, city.name, city.timezone]
         );
@@ -438,7 +445,8 @@ async function seedAirports(cityMap: Map<string, number>): Promise<void> {
   ];
   
   // Check which airports already exist
-  const existingAirports = await executeQuery<{ code: string }[]>(
+  interface AirportCodeRow extends RowDataPacket { code: string; }
+  const existingAirports = await executeQuery<AirportCodeRow[]>(
     'SELECT code FROM airports'
   );
   

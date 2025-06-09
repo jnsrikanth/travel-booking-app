@@ -76,7 +76,7 @@ async function initializeDatabase() {
         const sql = fs.readFileSync(filePath, 'utf8');
         
         // Split the SQL by delimiter to handle stored procedures and triggers
-        const statements = sql.split(';').filter(stmt => stmt.trim());
+        const statements = sql.split(';').filter((stmt: string) => stmt.trim());
         
         for (const statement of statements) {
           if (statement.trim()) {
@@ -118,3 +118,5 @@ async function initializeDatabase() {
 // Run the initialization
 initializeDatabase();
 
+
+export {};

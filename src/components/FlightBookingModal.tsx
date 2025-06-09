@@ -48,8 +48,9 @@ const FlightBookingModal: React.FC<FlightBookingModalProps> = ({
   const [error, setError] = useState<string | null>(null);
   
   // Calculate taxes (typically around 12-18% of base fare)
-  const taxAmount = Math.round(flight.price * 0.15);
-  const totalAmount = flight.price + taxAmount;
+  const basePrice = flight.price || 0;
+  const taxAmount = Math.round(basePrice * 0.15);
+  const totalAmount = basePrice + taxAmount;
   
   const handlePassengerSubmit = (passengerData: Passenger) => {
     setPassenger(passengerData);
@@ -136,7 +137,7 @@ const FlightBookingModal: React.FC<FlightBookingModalProps> = ({
                 <h4 className="font-medium text-gray-800 mb-2">Price Breakdown</h4>
                 <div className="flex justify-between mb-1">
                   <span>Base Fare</span>
-                  <span>₹{flight.price.toLocaleString()}</span>
+                  <span>₹{(flight.price || 0).toLocaleString()}</span>
                 </div>
                 <div className="flex justify-between mb-1">
                   <span>Taxes & Fees</span>

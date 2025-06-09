@@ -1,7 +1,8 @@
 FROM node:18-alpine
 WORKDIR /app
 COPY backend/package*.json ./
-RUN npm install
+RUN npm cache clean --force && \
+    npm install
 COPY backend .
 EXPOSE 4000
-CMD ["npm", "run", "dev"]
+CMD ["npm", "run", "start"]

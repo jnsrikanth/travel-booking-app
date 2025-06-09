@@ -1,0 +1,2 @@
+Always run servers, compilation processes, and other long-running tasks in the background using & or appropriate background process management to avoid blocking the terminal console. This helps maintain terminal interactivity and allows for parallel tasks.
+

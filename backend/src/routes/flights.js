@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const aviationStack = require('../services/aviationStack');
+const logger = require('../utils/logger');
 
 // Add at the beginning of the routes
 router.get('/test', (req, res) => {
@@ -25,43 +26,11 @@ router.get('/', async (req, res) => {
       returnDate,
       adults,
       travelClass,
-      isFutureSearch
+      isFutureRequest
     } = req.query;
 
-    // Normalize isFutureSearch parameter to ensure consistent handling
-    const normalizedIsFutureSearch = 
-      isFutureSearch === 'true' || isFutureSearch === true || isFutureSearch === '1';
-
-    // Validate required parameters
-    if (!originLocationCode || !destinationLocationCode || !departureDate) {
-      return res.status(400).json({
-        error: 'Missing required parameters',
-        message: 'originLocationCode, destinationLocationCode, and departureDate are required'
-      });
-    }
-
-    // Check if this is a future date search
-    const today = new Date();
-    today.setHours(0, 0, 0, 0); // Reset time for proper comparison
-    const searchDate = new Date(departureDate);
-    searchDate.setHours(0, 0, 0, 0);
-    
-    // Determine if this is a future flight request based on:
-    // 1. Explicit isFutureSearch parameter (from frontend)
-    // 2. Date comparison (as a fallback)
-    const isFutureRequest = normalizedIsFutureSearch || (searchDate > today);
-    
-    // Enhanced logging for future flight detection
-    console.log('[FLIGHT SEARCH] Future flight detection:', { 
-      originalParam: isFutureSearch,
-      normalizedParam: normalizedIsFutureSearch,
-      searchDate: searchDate.toISOString(),
-      today: today.toISOString(),
-      dateComparison: searchDate > today,
-      isFutureRequest
-    });
-    
-    console.log('[FLIGHT SEARCH] Searching with params:', {
+    // Log request parameters
+    logger.info('[FLIGHT SEARCH] Request params:', {
       originLocationCode,
       destinationLocationCode,
       departureDate,
@@ -70,11 +39,6 @@ router.get('/', async (req, res) => {
       travelClass,
       isFutureRequest
     });
-    
-    // If this is a future request, add logging
-    if (isFutureRequest) {
-      console.log(`[FLIGHT SEARCH] Future flight search detected for date: ${departureDate}`);
-    }
 
     const result = await aviationStack.searchFlights({
       originLocationCode,
@@ -83,36 +47,45 @@ router.get('/', async (req, res) => {
       returnDate,
       adults: parseInt(adults || '1', 10),
       travelClass: travelClass || 'ECONOMY',
-      isFutureRequest, // Pass the flag to the aviationStack service
-      flightType: isFutureRequest ? 'future' : 'current' // Add explicit flight type for clarity
+      isFutureRequest: isFutureRequest === 'true'
     });
 
     return res.json({
       flights: result.flights || [],
       metadata: {
         count: result.flights ? result.flights.length : 0,
+        source: result.source,
+        timestamp: result.timestamp,
         requestInfo: {
           origin: originLocationCode,
           destination: destinationLocationCode,
           date: departureDate,
           class: travelClass || 'ECONOMY'
         },
-        dateValidation: result.dateValidation,
-        apiResponse: result.apiResponse,
-        ...(result.emptyResultContext && { 
-          emptyResultContext: result.emptyResultContext 
-        })
+        apiResponse: result.apiResponse
       }
     });
   } catch (error) {
-    console.error('[FLIGHT SEARCH] Error:', error.message);
-    return res.status(500).json({
+    logger.error('[FLIGHT SEARCH] Error:', error.message);
+    
+    // Determine appropriate status code based on error type
+    let statusCode = 500;
+    let errorMessage = error.message;
+    
+    if (error.message.includes('API Limit Reached')) {
+      statusCode = 429;
+    } else if (error.message.includes('Invalid parameters')) {
+      statusCode = 400;
+    } else if (error.message.includes('Connection timeout')) {
+      statusCode = 504;
+    }
+    
+    return res.status(statusCode).json({
       flights: [],
       metadata: {
         count: 0,
-        error: 'Error in flight search response',
-        message: error.message,
-        details: error.response?.data || null
+        error: errorMessage,
+        timestamp: new Date().toISOString()
       }
     });
   }

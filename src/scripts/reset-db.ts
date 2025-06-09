@@ -67,3 +67,5 @@ async function resetDatabase() {
 // Run the reset
 resetDatabase();
 
+
+export {};
