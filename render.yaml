@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: travel-booking-app
+    env: node
+    buildCommand: cd backend && npm install
+    startCommand: cd backend && npm start
+    envVars:
+      - key: AVIATION_STACK_API_KEY
+        value: 0ce8fc39e995d3b86eb5982ea31f9004
+      - key: NODE_ENV
+        value: production
+    healthCheckPath: /health
+    
+  - type: cron
+    name: api-tests
+    env: node
+    buildCommand: cd backend && npm install
+    schedule: "0 */6 * * *"  # Every 6 hours
+    startCommand: cd backend && node tests/comprehensive-api-test.js
+    envVars:
+      - key: AVIATION_STACK_API_KEY
+        value: 0ce8fc39e995d3b86eb5982ea31f9004
+      - key: API_BASE_URL
+        value: https://travel-booking-app.onrender.com

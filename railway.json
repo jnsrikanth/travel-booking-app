@@ -1,0 +1,27 @@
+{
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "cd backend && npm start",
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 100,
+    "sleepApplication": false,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
+  },
+  "environments": {
+    "production": {
+      "variables": {
+        "NODE_ENV": "production",
+        "PORT": "$PORT"
+      }
+    },
+    "development": {
+      "variables": {
+        "NODE_ENV": "development",
+        "PORT": "$PORT"
+      }
+    }
+  }
+}
