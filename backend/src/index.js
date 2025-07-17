@@ -50,12 +50,11 @@ console.log('[SERVER] Mounted aviation router at /api path');
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  const serviceStatus = aviationService.getServiceStatus();
   res.json({
     status: 'healthy',
     environment: NODE_ENV,
     apiKey: AVIATION_STACK_API_KEY ? 'configured' : 'missing',
-    service: serviceStatus
+    timestamp: new Date().toISOString()
   });
 });
 
